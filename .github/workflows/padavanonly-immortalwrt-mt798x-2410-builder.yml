@@ -1,13 +1,8 @@
 #
 # https://github.com/P3TERX/Actions-OpenWrt
 #
-# File: .github/workflows/openwrt-bulder.yml
-# Description: Build OpenWrt using GitHub Actions
-#
-# Copyright (c) 2019-2024 P3TERX <https://p3terx.com>
-#
-# This is free software, licensed under the MIT License.
-# See /LICENSE for more information.
+# File: .github/workflows/padavanonly-immortalwrt-mt798x-2410-builder.yml
+# Description: Build OpenWrt (237 2410线 / 5.4内核) for Netcore N60 PRO
 #
 
 name: padavanonly-immortalwrt-mt798x-2410-builder
@@ -15,6 +10,11 @@ name: padavanonly-immortalwrt-mt798x-2410-builder
 on:
   repository_dispatch:
   workflow_dispatch:
+
+# 优化：重复触发时自动取消旧的运行，避免浪费 Actions 额度
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   REPO_URL: https://github.com/padavanonly/immortalwrt-mt798x-6.6
@@ -84,6 +84,12 @@ jobs:
       run: |
         cd openwrt
         make defconfig
+        echo "########## 诊断：目标设备选择 ##########"
+        grep -E '^CONFIG_TARGET_DEVICE.*=y' .config || echo "!!! 警告：未选中任何设备，固件将不会生成 !!!"
+        echo "########## 诊断：Rust 相关依赖 ##########"
+        grep -E 'SHADOWSOCKS_RUST|PACKAGE_rust|TUIC_CLIENT|SHADOW_TLS|DNS2SOCKS_RUST' .config | grep -v 'not set' || echo "无 rust 系包被选中"
+        echo "########## 诊断：defconfig 展开摘要 ##########"
+        ./scripts/diffconfig.sh | head -60 || true
         make download -j8
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
@@ -101,7 +107,7 @@ jobs:
           done
           echo "### rust vendor .orig files patched ###"
         fi
-        # ---- 原有编译命令 ----
+        # ---- 编译 ----
         make -j$(nproc) || make -j1 || make -j1 V=s
         echo "status=success" >> $GITHUB_OUTPUT
         grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
@@ -128,12 +134,14 @@ jobs:
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
         echo "status=success" >> $GITHUB_OUTPUT
 
+    # 优化：产物目录为空时直接报错，杜绝"全绿但没固件"
     - name: Upload firmware directory
       uses: actions/upload-artifact@main
       if: steps.organize.outputs.status == 'success' && !cancelled()
       with:
         name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
         path: ${{ env.FIRMWARE }}
+        if-no-files-found: error
 
     - name: Generate release tag
       id: tag
@@ -144,6 +152,7 @@ jobs:
         [ ${UPLOAD_GOFILE} = true && ${{ steps.gofile.outputs.url }} ] && echo "🔗 [GoFile](${{ steps.gofile.outputs.url }})" >> release.txt
         echo "status=success" >> $GITHUB_OUTPUT
 
+    # 优化：没有匹配文件时 Release 直接失败，不会再出现空 Release
     - name: Upload firmware to release
       uses: softprops/action-gh-release@master
       if: steps.tag.outputs.status == 'success' && !cancelled()
@@ -153,6 +162,7 @@ jobs:
         tag_name: ${{ steps.tag.outputs.release_tag }}
         body_path: release.txt
         files: ${{ env.FIRMWARE }}/*
+        fail_on_unmatched_files: true
 
     - name: Delete workflow runs
       uses: Mattraks/delete-workflow-runs@main

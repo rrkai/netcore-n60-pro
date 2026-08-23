@@ -38,8 +38,7 @@ config rule
         option target 'ACCEPT'
 EOF
 # ===== 修改主机名为 WaterOS =====
-sed -i 's/OpenWrt/WaterOS/g' package/base-files/files/bin/config_generate
-sed -i 's/openwrt/WaterOS/g' package/base-files/files/bin/config_generate
+sed -i "s/hostname='ImmortalWrt'/hostname='WaterOS'/" package/base-files/files/bin/config_generate
 
 # ===== 设置 root 密码为 www666 =====
 # 方法1：生成密码哈希并写入 shadow 文件

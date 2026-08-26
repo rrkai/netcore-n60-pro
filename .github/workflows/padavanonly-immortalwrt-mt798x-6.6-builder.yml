@@ -88,6 +88,8 @@ jobs:
         grep -E '^CONFIG_TARGET_DEVICE.*=y' .config || echo "!!! 警告：未选中任何设备，固件将不会生成 !!!"
         echo "########## 诊断：Rust 相关依赖 ##########"
         grep -E 'SHADOWSOCKS_RUST|PACKAGE_rust|TUIC_CLIENT|SHADOW_TLS|DNS2SOCKS_RUST' .config | grep -v 'not set' || echo "无 rust 系包被选中"
+        echo "########## 诊断：关键插件选中状态 ##########"
+        grep -E '^CONFIG_PACKAGE_(luci-app-passwall|luci-app-ssr-plus|luci-app-homeproxy|sing-box)=y' .config || echo "!!! 警告：没有任何代理插件被选中，请检查 config 和 feed !!!"
         echo "########## 诊断：defconfig 展开摘要 ##########"
         ./scripts/diffconfig.sh | head -60 || true
         make download -j8

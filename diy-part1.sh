@@ -12,6 +12,9 @@
 echo 'src-git helloworld https://github.com/fw876/helloworld' >>feeds.conf.default
 #echo 'src-git passwall https://github.com/xiaorouji/openwrt-passwall' >>feeds.conf.default
 
+# ===== 新增：设置向导 源 =====
+echo 'src-git netwizard https://github.com/sirpdboy/luci-app-netwizard.git;main' >>feeds.conf.default
+
 # ===== 新增：PassWall 源 =====
 echo 'src-git passwall https://github.com/Openwrt-Passwall/openwrt-passwall.git;main' >>feeds.conf.default
 echo 'src-git passwall_packages https://github.com/Openwrt-Passwall/openwrt-passwall-packages.git;main' >>feeds.conf.default

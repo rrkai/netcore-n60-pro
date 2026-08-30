@@ -71,11 +71,11 @@ jobs:
     - name: Install feeds
       run: |
         cd openwrt
-        # 必须在 install 之前删：官方 luci feed 内置了旧版 luci-app-passwall（25.12.x），
-        # 且安装顺序排在我们自己的 passwall feed 前面，同名包会被官方先占位、
-        # 导致新源版本被跳过。先删源再安装，才能保证新版从 feeds/passwall 装上。
-        # （旧写法是安装后才删，结果两边都没了，passwall 整个从固件中消失）
+        # 官方 luci feed 内置了旧版 luci-app-passwall（25.12.x），同名包会挤掉我们的新源。
+        # 必须三步走：1) 删掉官方内置版源码  2) update -i 重建索引（关键！只删目录不重建索引，
+        # 旧索引仍会照旧版占位，导致 passwall feed 被静默跳过、零包安装）  3) 再 install。
         rm -rf feeds/luci/applications/luci-app-passwall
+        ./scripts/feeds update -i
         ./scripts/feeds install -a
         rm -rf package/feeds/luci/luci-app-passwall package/feeds/luci/luci-i18n-passwall-zh-cn
         echo "########## 验证：passwall 包来源（必须指向 feeds/passwall）##########"

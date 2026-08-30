@@ -2,10 +2,10 @@
 # https://github.com/P3TERX/Actions-OpenWrt
 #
 # File: .github/workflows/padavanonly-immortalwrt-mt798x-2410-builder.yml
-# Description: Build OpenWrt (237 2410线 / 5.4内核) for Netcore N60 PRO
+# Description: TKubeOS — Netcore N60 PRO 定制固件云编译（237 2410线 / 5.4内核）
 #
 
-name: padavanonly-immortalwrt-mt798x-2410-builder
+name: TKubeOS-2410-builder
 
 on:
   repository_dispatch:
@@ -26,7 +26,7 @@ env:
   UPLOAD_BIN_DIR: false
   UPLOAD_FIRMWARE: true
   UPLOAD_RELEASE: true
-  FIRMWARE_TAG: padavanonly-237-mt798x-2410
+  FIRMWARE_TAG: TKubeOS-2410
   TZ: Asia/Shanghai
 
 jobs:
@@ -142,6 +142,8 @@ jobs:
       run: |
         cd openwrt/bin/targets/*/*
         rm -rf packages
+        # 只发布 sysupgrade 固件；initramfs（内存救援镜像）、bl2、buildinfo、manifest 等一律不发布
+        find . -maxdepth 1 -type f ! -name '*-squashfs-sysupgrade.bin' -delete
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
         echo "status=success" >> $GITHUB_OUTPUT
 
@@ -159,7 +161,12 @@ jobs:
       if: env.UPLOAD_RELEASE == 'true' && !cancelled()
       run: |
         echo "release_tag=$(date +"%Y.%m.%d-%H%M")-${{ env.FIRMWARE_TAG }}" >> $GITHUB_OUTPUT
-        touch release.txt
+        cat > release.txt <<EOF
+        ### TKubeOS · Netcore N60 PRO 定制固件（237 2410线 / 5.4内核）
+        - 构建时间：$(date +"%Y-%m-%d %H:%M")
+        - 默认地址：192.168.1.1 | root 密码：www666
+        - WiFi：TKubeOS-2.4G / TKubeOS-5G
+        EOF
         echo "status=success" >> $GITHUB_OUTPUT
 
     # 优化：没有匹配文件时 Release 直接失败，不会再出现空 Release

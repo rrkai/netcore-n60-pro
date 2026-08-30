@@ -71,14 +71,15 @@ jobs:
     - name: Install feeds
       run: |
         cd openwrt
-        ./scripts/feeds install -a
-        # 237 自带的 luci feed（immortalwrt/luci openwrt-24.10）内置了旧版 luci-app-passwall（25.12.x），
-        # 包扫描时优先于同名第三方 feed，导致我们添加的新版 passwall 源被覆盖。
-        # 这里删掉 luci feed 里的内置版本，强制使用 Openwrt-Passwall 组织的新版源。
+        # 必须在 install 之前删：官方 luci feed 内置了旧版 luci-app-passwall（25.12.x），
+        # 且安装顺序排在我们自己的 passwall feed 前面，同名包会被官方先占位、
+        # 导致新源版本被跳过。先删源再安装，才能保证新版从 feeds/passwall 装上。
+        # （旧写法是安装后才删，结果两边都没了，passwall 整个从固件中消失）
         rm -rf feeds/luci/applications/luci-app-passwall
+        ./scripts/feeds install -a
         rm -rf package/feeds/luci/luci-app-passwall package/feeds/luci/luci-i18n-passwall-zh-cn
-        echo "########## 验证：passwall 包来源（应指向 feeds/passwall）##########"
-        ls -l package/feeds/*/luci-app-passwall || true
+        echo "########## 验证：passwall 包来源（必须指向 feeds/passwall）##########"
+        ls -l package/feeds/*/luci-app-passwall || echo "!!! 严重警告：passwall 包未安装，固件将缺少 PassWall !!!"
 
     - name: Load custom configuration
       run: |

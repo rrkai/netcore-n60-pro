@@ -11,13 +11,6 @@ A template for building OpenWrt with GitHub Actions
 ## Usage
 
 - 点击 [Fork] 按钮生成新项目.
-- [LEDE源码](https://github.com/coolsnowwolf/lede)，自定义脚本diy-part2.sh，配置文件LEDE.config.
-- [dailook源码](https://github.com/dailook/immortalwrt-mt798x)，自定义脚本diy-part3.sh，配置文件dailook-hanwckf.config.该源码适配了硬改后的512M闪存，如果需要编译512M的ROM，需要在dailook-hanwckf.config文件里面添加如下内容：
- ```bash
-CONFIG_TARGET_DEVICE_mediatek_mt7986_DEVICE_netcore_n60pro-512rom=y
-CONFIG_TARGET_DEVICE_PACKAGES_mediatek_mt7986_DEVICE_netcore_n60pro-512rom=""
-```
-- [Immortalwrt源码](https://github.com/immortalwrt/immortalwrt)，自定义脚本diy-part4.sh，配置文件immortalwrt.config.
 - [237源码](https://github.com/padavanonly/immortalwrt-mt798x-24.10)，6.6内核自定义脚本diy-part5-6.6.sh，配置文件padavanonly-immortalwrt-mt798x-6.6.config，5.4内核版本自定义脚本diy-part5-2410.sh，配置文件padavanonly-immortalwrt-mt798x-2410.config.
 - diy-part1.sh是共用脚本，加入了ADGuardHome源码，所有默认配置文件只集成了定时重启、终端ttyd、组播代理omcproxy、组播转换msd_lite和ADGuardHome的luci，需要自定义的请自行修改对应的自定义脚本和配置文件.
 - ADGuardHome正常使用需要在luci里面手动下载[Linux_arm64核心文件](https://github.com/AdguardTeam/AdGuardHome/releases/),或者PC下载后解压将AdGuardHome上传至/usr/bin/AdGuardHome/，设置权限0755.

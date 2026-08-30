@@ -100,6 +100,8 @@ jobs:
         grep -E 'SHADOWSOCKS_RUST|PACKAGE_rust|TUIC_CLIENT|SHADOW_TLS|DNS2SOCKS_RUST' .config | grep -v 'not set' || echo "无 rust 系包被选中"
         echo "########## 诊断：关键插件选中状态 ##########"
         grep -E '^CONFIG_PACKAGE_(luci-app-passwall|luci-app-ssr-plus|luci-app-homeproxy|luci-app-netwizard|sing-box)=y' .config || echo "!!! 警告：没有任何代理插件被选中，请检查 config 和 feed !!!"
+        echo "########## 诊断：固件版本标识（品牌化）##########"
+        grep -E '^CONFIG_(IMAGEOPT|VERSIONOPT|VERSION_DIST|VERSION_MANUFACTURER|VERSION_PRODUCT)=' .config || echo "!!! 警告：品牌化配置被 defconfig 丢弃，固件将显示 ImmortalWrt !!!"
         echo "########## 诊断：defconfig 展开摘要 ##########"
         ./scripts/diffconfig.sh | head -60 || true
         make download -j8

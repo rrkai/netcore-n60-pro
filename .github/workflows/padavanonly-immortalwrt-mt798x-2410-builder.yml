@@ -133,6 +133,19 @@ jobs:
         exit 0
         XRAYEOF
         chmod +x $GITHUB_WORKSPACE/files/etc/uci-defaults/97-upgrade-xray
+        # ===== 移除 ttyd 网页终端 =====
+        # 6.6 分支底座把 luci-app-ttyd 写死在 target/linux/mediatek/Makefile 的 DEFAULT_PACKAGES 里，
+        # DEFAULT_PACKAGES 是无条件安装（不走 Kconfig），config 里 "is not set" 拦不住。
+        # 2410 分支的该文件没有 ttyd 条目，sed 不匹配无副作用，保留此段保证两线行为一致。
+        # 只删包名不删整行：同一行还有其他默认包。
+        sed -i 's/luci-app-ttyd //' target/linux/mediatek/Makefile
+        echo "########## 验证：ttyd 已从默认包移除 ##########"
+        if grep -q 'luci-app-ttyd' target/linux/mediatek/Makefile; then
+          echo "!!! 警告：ttyd 仍残留于默认包清单 !!!"
+          grep -n 'luci-app-ttyd' target/linux/mediatek/Makefile
+        else
+          echo "确认：默认包已无 ttyd（2410 底座本就没有，正常）"
+        fi
         # ===== 钉死 luci-app-passwall 版本为 26.8.26-1 =====
         # feeds update 后 passwall feed 停在 main 最新，checkout 到 tag 钉住版本，
         # 避免上游后续更新导致固件行为变化。必须在 update -i 重建索引之前完成，

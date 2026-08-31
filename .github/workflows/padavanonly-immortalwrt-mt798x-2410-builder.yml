@@ -76,6 +76,9 @@ jobs:
         # 避免上游后续更新导致固件行为变化。必须在 update -i 重建索引之前完成，
         # 否则索引记录的还是 main 的版本。
         cd feeds/passwall
+        # feeds update 克隆时不会拉全 tag（08/31 实锤：checkout tags/xxx 报 pathspec did not match），
+        # 必须先 fetch --tags 再 checkout
+        git fetch --tags origin
         git checkout tags/26.8.26-1
         echo "########## 验证：passwall 钉版本结果（应为 26.8.26 / release 1）##########"
         grep -E 'PKG_VERSION|PKG_RELEASE' luci-app-passwall/Makefile

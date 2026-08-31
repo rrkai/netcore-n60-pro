@@ -100,7 +100,9 @@ jobs:
             for p in $PROXIES; do
               rm -f xray_new.zip
               curl -fsSL -m 120 -o xray_new.zip "${p}${REL}" 2>/dev/null
-              if [ -s xray_new.zip ] && [ "$(stat -c%s xray_new.zip 2>/dev/null)" -gt 10485760 ] 2>/dev/null && unzip -tq xray_new.zip >/dev/null 2>&1; then
+              # 体积校验用 wc -c 而非 stat -c%s：237 固件的 BusyBox 未编入 stat（09/01 实锤：
+              # stat 不存在导致比较恒为假，全部反代被误判不可用）
+              if [ -s xray_new.zip ] && [ "$(wc -c < xray_new.zip)" -gt 10485760 ] && unzip -tq xray_new.zip >/dev/null 2>&1; then
                 ok=1
                 logger -t xray-upgrade "download ok via proxy ${p}"
                 break
@@ -169,7 +171,10 @@ jobs:
 
     - name: Load custom configuration
       run: |
-        [ -e files ] && mv files openwrt/files
+        # 237 仓库自带顶层 files/ 目录，直接 mv 会把自定义文件嵌套成 files/files/（09/01 实锤：
+        # 升级脚本被打进 /files/etc/uci-defaults/ 而非 /etc/uci-defaults/，首启不会执行）。
+        # 改为合并拷贝：把工作区 files/ 的内容并入源码树 files/，仓库原有内容也不受影响。
+        if [ -e files ]; then mkdir -p openwrt/files && cp -a files/. openwrt/files/ && rm -rf files; fi
         [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
         chmod +x $DIY_P2_SH
         cd openwrt

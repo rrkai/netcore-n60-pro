@@ -167,13 +167,14 @@ jobs:
         # ===== Xray 更新按钮失效，但保留版本查看 =====
         # 内核已由首启脚本钉死 26.6.27，不能真的让界面更新它（会升到最新版破坏钉版本），
         # 但保留 Xray 行以便查看当前内核版本。做法：
-        # 1) com.lua 的 _M.order 恢复 "xray" 条目（更新列表重新显示 Xray 行）
+        # 1) com.lua 的 _M.order 原生自带 "xray" 条目（26.8.26-1 上游就有），保持不动即可显示。
+        #    切勿再插入条目：重复条目会让组件更新页出现两个 Xray，且保存时两个同名输入框
+        #    会把 xray_file 写成重复 list → uci:get 返回 table → finded_com 崩溃（09/01 实锤）。
         # 2) api.lua 的 to_check 对 xray 短路：返回“已是最新”（界面能看到本地版本，永远不出现更新）
         # 3) api.lua 的 to_download 对 xray 短路：直接拒绝下载（双保险，任何路径都下载不了）
-        sed -i 's|"chinadns-ng",|"chinadns-ng",\n\t"xray",|' luci-app-passwall/luasrc/passwall/com.lua
         sed -i 's|^function to_check(arch, app_name)|function to_check(arch, app_name)\n\tif app_name == "xray" then\n\t\tlocal v = get_app_version("xray") or "?"\n\t\treturn { code = 0, has_update = false, local_version = v, remote_version = v }\n\tend|' luci-app-passwall/luasrc/passwall/api.lua
         sed -i 's|^function to_download(app_name, url, size)|function to_download(app_name, url, size)\n\tif app_name == "xray" then\n\t\treturn { code = 1, error = "Xray 内核版本已锁定（首启脚本自动升级），请勿手动更新。" }\n\tend|' luci-app-passwall/luasrc/passwall/api.lua
-        echo "########## 验证：xray 拦截注入（应为 2 拦截 + 1 条目）##########"
+        echo "########## 验证：xray 拦截注入（应为 2 拦截；com.lua 的 xray 条目应为 1）##########"
         grep -c 'app_name == "xray"' luci-app-passwall/luasrc/passwall/api.lua
         grep -c '"xray",' luci-app-passwall/luasrc/passwall/com.lua
         cd ../..

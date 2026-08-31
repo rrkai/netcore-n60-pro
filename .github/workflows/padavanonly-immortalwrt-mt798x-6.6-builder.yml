@@ -151,13 +151,18 @@ jobs:
         echo "########## 验证：反代替换结果（应为 2 处 gh.tkubeos.com、0 处残留）##########"
         echo "gh.tkubeos.com 出现: $(grep -c 'gh\.tkubeos\.com' luci-app-passwall/luasrc/passwall/api.lua)"
         echo "gh-proxy.org 残留: $(grep -c 'gh-proxy\.org' luci-app-passwall/luasrc/passwall/api.lua || true)"
-        # ===== 禁用界面里的 Xray 内核更新 =====
-        # 内核已由首启脚本钉死 26.6.27，界面“检查更新”不能再动它（手动点会升到最新版破坏钉版本）。
-        # com.lua 的 _M.order 是更新列表的组件清单，删掉 "xray" 条目，界面就不再显示/更新 Xray；
-        # geo/sing-box/hysteria 等其他组件不受影响。
-        sed -i '/"xray",/d' luci-app-passwall/luasrc/passwall/com.lua
-        echo "########## 验证：xray 已从更新列表移除（应为 0 行）##########"
-        grep -c '"xray",' luci-app-passwall/luasrc/passwall/com.lua || echo "确认：更新列表已无 xray"
+        # ===== Xray 更新按钮失效，但保留版本查看 =====
+        # 内核已由首启脚本钉死 26.6.27，不能真的让界面更新它（会升到最新版破坏钉版本），
+        # 但保留 Xray 行以便查看当前内核版本。做法：
+        # 1) com.lua 的 _M.order 恢复 "xray" 条目（更新列表重新显示 Xray 行）
+        # 2) api.lua 的 to_check 对 xray 短路：返回“已是最新”（界面能看到本地版本，永远不出现更新）
+        # 3) api.lua 的 to_download 对 xray 短路：直接拒绝下载（双保险，任何路径都下载不了）
+        sed -i 's|"chinadns-ng",|"chinadns-ng",\n\t"xray",|' luci-app-passwall/luasrc/passwall/com.lua
+        sed -i 's|^function to_check(arch, app_name)|function to_check(arch, app_name)\n\tif app_name == "xray" then\n\t\tlocal v = get_app_version("xray") or "?"\n\t\treturn { code = 0, has_update = false, local_version = v, remote_version = v }\n\tend|' luci-app-passwall/luasrc/passwall/api.lua
+        sed -i 's|^function to_download(app_name, url, size)|function to_download(app_name, url, size)\n\tif app_name == "xray" then\n\t\treturn { code = 1, error = "Xray 内核版本已锁定（首启脚本自动升级），请勿手动更新。" }\n\tend|' luci-app-passwall/luasrc/passwall/api.lua
+        echo "########## 验证：xray 拦截注入（应为 2 拦截 + 1 条目）##########"
+        grep -c 'app_name == "xray"' luci-app-passwall/luasrc/passwall/api.lua
+        grep -c '"xray",' luci-app-passwall/luasrc/passwall/com.lua
         cd ../..
         # 官方 luci feed 内置了旧版 luci-app-passwall（25.12.x），同名包会挤掉我们的新源。
         # 必须三步走：1) 删掉官方内置版源码  2) update -i 重建索引（关键！只删目录不重建索引，

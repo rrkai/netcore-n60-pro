@@ -11,11 +11,6 @@ on:
   repository_dispatch:
   workflow_dispatch:
 
-# 优化：重复触发时自动取消旧的运行，避免浪费 Actions 额度
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 env:
   REPO_URL: https://github.com/padavanonly/immortalwrt-mt798x-6.6
   REPO_BRANCH: 2410

@@ -212,7 +212,7 @@ jobs:
         #   model         输出设备型号（读 /etc/tkubeos_model，编译时写入）
         #   ver           输出当前固件版本
         #   check         向服务器查询授权与更新，输出 JSON
-        #   update start  校验授权后启动后台下载（立即返回，前端轮询 status 拿进度）
+        #   update start  启动后台升级线程（零网络、立即返回；授权查询/下载/刷入全在后台，前端轮询 status 拿进度）
         #   update status 输出进度 JSON：{stage, percent, detail, log}
         #   update        （不带子命令=旧版同步模式，仅命令行调试用）
         
@@ -269,27 +269,37 @@ jobs:
         	printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n' ' '
         }
         
-        # 查询授权并落盘 url/sha/size；失败时输出错误 JSON 并返回非 0
+        # 查询授权并落盘 url/sha/size；失败时写 error 状态并返回非 0。
+        # 不向 stdout 输出：本函数只被后台 worker 调用，错误信息由 update status 呈现。
         prepare_update() {
         	local resp auth has url sha size
-        	resp="$(http_check)" || { echo '{"error":"network"}'; return 1; }
+        	resp="$(http_check)" || { echo "error:network" > "$FW_STATE"; return 1; }
         	auth="$(echo "$resp" | jsonfilter -e '@.authorized' 2>/dev/null)"
-        	[ "$auth" = "true" ] || { echo '{"error":"not-authorized"}'; return 2; }
+        	[ "$auth" = "true" ] || { echo "error:not-authorized" > "$FW_STATE"; return 2; }
         	has="$(echo "$resp" | jsonfilter -e '@.has_update' 2>/dev/null)"
-        	[ "$has" = "true" ] || { echo '{"error":"no-update"}'; return 3; }
+        	[ "$has" = "true" ] || { echo "error:no-update" > "$FW_STATE"; return 3; }
         	url="$(echo "$resp" | jsonfilter -e '@.url' 2>/dev/null)"
         	sha="$(echo "$resp" | jsonfilter -e '@.sha256' 2>/dev/null)"
         	size="$(echo "$resp" | jsonfilter -e '@.size' 2>/dev/null)"
-        	[ -n "$url" ] && [ -n "$sha" ] || { echo '{"error":"bad-response"}'; return 4; }
-        	rm -f "$FW_TMP" "$FW_STATE" "$FW_LOG"
+        	[ -n "$url" ] && [ -n "$sha" ] || { echo "error:bad-response" > "$FW_STATE"; return 4; }
+        	# FW_STATE/FW_LOG 由 start 已清理，这里只清镜像临时文件（避免误删 preparing 日志）
+        	rm -f "$FW_TMP"
         	printf '%s\n%s\n%s\n' "$url" "$sha" "$size" > "$FW_META"
         	echo "downloading" > "$FW_STATE"
         	return 0
         }
         
-        # 后台工作线程：下载 → 体积校验 → sha256 校验 → 刷入，全程写日志
+        # 后台工作线程：授权查询 → 下载 → 体积校验 → sha256 校验 → 刷入，全程写日志
         do_worker() {
         	local url sha size real got
+        	# 授权查询放在 worker 内做：start 保持零网络秒回，避免慢网下 RPC 超时
+        	# 让前端误报“启动失败”（09/01 实锤：后台升级其实照常完成、设备照常重启）
+        	echo "preparing" > "$FW_STATE"
+        	log "正在检查授权与更新信息…"
+        	if ! prepare_update; then
+        		log "未能获取更新（见状态提示），流程终止"
+        		exit 1
+        	fi
         	url="$(sed -n 1p "$FW_META" 2>/dev/null)"
         	sha="$(sed -n 2p "$FW_META" 2>/dev/null)"
         	size="$(sed -n 3p "$FW_META" 2>/dev/null)"
@@ -336,6 +346,7 @@ jobs:
         	percent=0
         	detail=""
         	case "$stage" in
+        	preparing) percent=2; detail="正在检查授权与更新信息…" ;;
         	downloading)
         		cur="$(wc -c < "$FW_TMP" 2>/dev/null)"
         		[ -n "$cur" ] || cur=0
@@ -350,7 +361,17 @@ jobs:
         	verifying) percent=100; detail="正在校验固件完整性" ;;
         	flashing) percent=100; detail="校验通过，正在刷入固件并重启" ;;
         	done-noflash) percent=100; detail="调试模式：校验通过（未刷入）" ;;
-        	error:*) detail="升级失败，请重新点击立即更新" ;;
+        	error:*)
+        		case "$stage" in
+        		error:network) detail="网络异常：无法连接更新服务器，请检查联网后重试" ;;
+        		error:download-failed) detail="下载失败：网络中断或链接过期，请重新点击立即更新" ;;
+        		error:bad-size) detail="下载文件异常（体积过小），请重新点击立即更新" ;;
+        		error:sha-mismatch) detail="校验失败：文件与服务器不一致，请重新点击立即更新" ;;
+        		error:not-authorized) detail="设备未激活，请把机器号发送给客服开通" ;;
+        		error:no-update) detail="当前已是最新版本，无需更新" ;;
+        		error:bad-response) detail="服务器响应异常，请稍后重试" ;;
+        		*) detail="升级失败，请重新点击立即更新" ;;
+        		esac ;;
         	esac
         	logtail="$(tail -n 3 "$FW_LOG" 2>/dev/null)"
         	printf '{"stage":"%s","percent":%s,"detail":"%s","log":"%s"}\n' \
@@ -373,13 +394,16 @@ jobs:
         update)
         	case "$2" in
         	start)
-        		out="$(prepare_update)"
-        		rc=$?
-        		if [ $rc -ne 0 ]; then
-        			echo "$out"
-        			exit $rc
+        		# 防重复：已有后台线程在跑就直接返回（旧状态保持，前端继续轮询）
+        		if pgrep -f 'tkubeos-fwcheck _worker' >/dev/null 2>&1; then
+        			echo '{"started":true,"note":"already-running"}'
+        			exit 0
         		fi
-        		# 后台工作线程：下载/校验/刷入全在后台，start 立即返回
+        		# start 必须零网络、立即返回：授权查询/下载全部由 worker 后台完成。
+        		# 旧版在这里同步查服务器（最长 20 秒），慢网会超过 RPC 超时，前端误报
+        		# “启动失败”，而后台其实照常下载刷入重启（09/01 实锤）。
+        		rm -f "$FW_TMP" "$FW_LOG" "$FW_META"
+        		echo "preparing" > "$FW_STATE"
         		nohup "$0" _worker >/dev/null 2>&1 &
         		echo '{"started":true}'
         		;;
@@ -387,10 +411,9 @@ jobs:
         		do_status
         		;;
         	*)
-        		# 兼容旧调用：同步走完整个流程（命令行调试用；页面走 start+status）
-        		out="$(prepare_update)"
-        		rc=$?
-        		[ $rc -ne 0 ] && { echo "$out"; exit $rc; }
+        		# 兼容旧调用：与 start 相同（后台执行，update status 看进度）
+        		rm -f "$FW_TMP" "$FW_LOG" "$FW_META"
+        		echo "preparing" > "$FW_STATE"
         		nohup "$0" _worker >/dev/null 2>&1 &
         		echo '{"started":true}'
         		;;
@@ -545,33 +568,29 @@ jobs:
         
         		this.btnUpgrade.disabled = 'disabled';
         		this.setBar(2, '');
-        		this.setStatus(_('正在检查授权与更新…'));
+        		this.setStatus(_('正在启动后台升级…'));
+        		this.failCount = 0;
+        
+        		// start 是纯本地命令（秒回）。即便这次 RPC 出异常，后台线程也可能已启动，
+        		// 所以不判失败，直接转入进度轮询兜底（旧版在这里判“启动失败”，但设备其实
+        		// 照常升级重启——09/01 实锤）。
+        		var startPoll = L.bind(function () {
+        			if (!this.pollTimer)
+        				this.pollTimer = window.setInterval(L.bind(this.pollStatus, this), POLL_MS);
+        		}, this);
         
         		return fs.exec(CHECK_SCRIPT, ['update', 'start']).then(L.bind(function (res) {
         			var r = this.parseJson(res.stdout);
-        			if (res.code !== 0 || !r) {
-        				this.upgradeFail(_('启动失败：无法连接更新服务'));
-        				return;
+        			if (res.code !== 0 || !r || !r.started) {
+        				// 启动异常不直接报错：转入轮询，由连续失败来最终判定
+        				this.setStatus(_('启动较慢，正在跟踪后台进度…'));
+        			} else {
+        				this.setStatus(_('已启动后台升级，进度如下：'));
         			}
-        			if (r.error) {
-        				var msgs = {
-        					'network': _('网络异常，请检查联网后重试'),
-        					'not-authorized': _('设备未激活，请联系客服开通'),
-        					'no-update': _('当前已是最新版本'),
-        					'bad-response': _('服务器响应异常，请稍后重试')
-        				};
-        				this.upgradeFail(msgs[r.error] || String(r.error));
-        				return;
-        			}
-        			if (!r.started) {
-        				this.upgradeFail(_('启动失败'));
-        				return;
-        			}
-        			this.failCount = 0;
-        			this.setStatus(_('已启动后台下载，进度如下：'));
-        			this.pollTimer = window.setInterval(L.bind(this.pollStatus, this), POLL_MS);
+        			startPoll();
         		}, this)).catch(L.bind(function () {
-        			this.upgradeFail(_('启动失败：请求超时或被拒绝'));
+        			this.setStatus(_('启动较慢，正在跟踪后台进度…'));
+        			startPoll();
         		}, this));
         	},
         
@@ -583,6 +602,10 @@ jobs:
         			if (r.log) this.showLog(r.log);
         
         			switch (r.stage) {
+        			case 'preparing':
+        				this.setBar(2, '');
+        				this.setStatus(_('正在检查授权与更新信息…'));
+        				break;
         			case 'downloading':
         				this.setBar(r.percent || 2, (r.percent || 0) + '%');
         				this.setStatus(_('正在下载固件：') + (r.detail || ''));
@@ -609,10 +632,13 @@ jobs:
         				}
         			}
         		}, this)).catch(L.bind(function () {
-        			// 刷入重启期间通信会短暂中断，多容忍几次再判失败
+        			// 刷入重启期间通信会短暂中断，多容忍几次再判失败；
+        			// 期间给温和提示，避免页面看起来像卡死（旧版只在最后才提示）
         			this.failCount++;
         			if (this.failCount > 10) {
-        				this.upgradeFail(_('与设备的通信中断，请刷新页面查看结果'));
+        				this.upgradeFail(_('与设备的通信中断超过 20 秒，请刷新页面查看结果'));
+        			} else if (this.failCount >= 3) {
+        				this.setStatus(_('正在等待设备响应…（升级或重启中属正常现象）'));
         			}
         		}, this));
         	},
@@ -763,6 +789,7 @@ jobs:
         cat > release.txt <<EOF
         ### TKubeOS · Netcore N60 PRO 定制固件（237 2410线 / 5.4内核）
         - 构建时间：$(date +"%Y-%m-%d %H:%M")
+        - 固件版本：$(cat $GITHUB_WORKSPACE/files/usr/share/tkubeos/version 2>/dev/null || echo 未知)
         - 默认地址：192.168.1.1 | root 密码：www666
         - WiFi：TKubeOS-2.4G / TKubeOS-5G
         - 在线更新：LuCI「系统 → 固件更新」（激活设备可一键检查并升级）

@@ -191,8 +191,9 @@ jobs:
     - name: Generate TKubeOS online update files
       run: |
         # ===== TKubeOS 在线更新功能（授权制，服务端 https://upfw.tkubeos.com）=====
-        # LuCI“系统→固件更新”页面：显示机器号/型号/当前版本，检查授权与新版，
-        # 授权通过且有新版时下载固件（体积+sha256 双重校验）并 sysupgrade 自动刷入。
+        # LuCI“系统→固件更新”页面：显示机器号/型号/当前版本，检查授权与新版；
+        # “立即更新”= update start 立即返回 + 后台下载/校验/刷入，前端每 2 秒轮询
+        # update status 渲染进度条与日志（旧版同步 exec 会在下载期间触发 RPC 超时“启动失败”）。
         # 所有文件编译时由 heredoc 生成进工作区 files/，随固件打包（本仓库无 files/ 目录，
         # 走的是和 97-upgrade-xray 相同的生成模式）。依赖：curl（PassWall 带入）、
         # jsonfilter（base-files 自带）、md5sum/sha256sum（coreutils/busybox 自带），均无需加包。
@@ -204,16 +205,23 @@ jobs:
         cat > $GITHUB_WORKSPACE/files/usr/sbin/tkubeos-fwcheck <<'FWEOF'
         #!/bin/sh
         # TKubeOS 固件更新助手（由 LuCI 页面调用）
-        # 用法: tkubeos-fwcheck {id|model|ver|check|update}
-        #   id     输出设备机器号（MAC 的 md5）
-        #   model  输出设备型号（读 /etc/tkubeos_model，编译时写入）
-        #   ver    输出当前固件版本
-        #   check  向服务器查询授权与更新，输出 JSON
-        #   update 下载固件并校验后自动刷入
+        # 用法: tkubeos-fwcheck {id|model|ver|check|update start|update status}
+        #   id            输出设备机器号（MAC 的 md5）
+        #   model         输出设备型号（读 /etc/tkubeos_model，编译时写入）
+        #   ver           输出当前固件版本
+        #   check         向服务器查询授权与更新，输出 JSON
+        #   update start  校验授权后启动后台下载（立即返回，前端轮询 status 拿进度）
+        #   update status 输出进度 JSON：{stage, percent, detail, log}
+        #   update        （不带子命令=旧版同步模式，仅命令行调试用）
         
         # 授权更新服务地址（与服务端 config.php 的 API_DOMAIN 一致）
         API_BASE="https://upfw.tkubeos.com"
         FW_TMP="/tmp/tkubeos-firmware.bin"
+        FW_STATE="/tmp/tkubeos-fw-state"
+        FW_META="/tmp/tkubeos-fw-meta"
+        FW_LOG="/tmp/tkubeos-fw.log"
+        
+        log() { echo "$(date '+%m-%d %H:%M:%S') $*" >> "$FW_LOG"; }
         
         machine_id() {
         	local mac
@@ -247,6 +255,97 @@ jobs:
         		-d "model=$(fw_model)"
         }
         
+        # 最小 JSON 转义（反斜杠、双引号，换行变空格），用于把日志塞进 JSON
+        json_escape() {
+        	printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n' ' '
+        }
+        
+        # 查询授权并落盘 url/sha/size；失败时输出错误 JSON 并返回非 0
+        prepare_update() {
+        	local resp auth has url sha size
+        	resp="$(http_check)" || { echo '{"error":"network"}'; return 1; }
+        	auth="$(echo "$resp" | jsonfilter -e '@.authorized' 2>/dev/null)"
+        	[ "$auth" = "true" ] || { echo '{"error":"not-authorized"}'; return 2; }
+        	has="$(echo "$resp" | jsonfilter -e '@.has_update' 2>/dev/null)"
+        	[ "$has" = "true" ] || { echo '{"error":"no-update"}'; return 3; }
+        	url="$(echo "$resp" | jsonfilter -e '@.url' 2>/dev/null)"
+        	sha="$(echo "$resp" | jsonfilter -e '@.sha256' 2>/dev/null)"
+        	size="$(echo "$resp" | jsonfilter -e '@.size' 2>/dev/null)"
+        	[ -n "$url" ] && [ -n "$sha" ] || { echo '{"error":"bad-response"}'; return 4; }
+        	rm -f "$FW_TMP" "$FW_STATE" "$FW_LOG"
+        	printf '%s\n%s\n%s\n' "$url" "$sha" "$size" > "$FW_META"
+        	echo "downloading" > "$FW_STATE"
+        	return 0
+        }
+        
+        # 后台工作线程：下载 → 体积校验 → sha256 校验 → 刷入，全程写日志
+        do_worker() {
+        	local url sha size real got
+        	url="$(sed -n 1p "$FW_META" 2>/dev/null)"
+        	sha="$(sed -n 2p "$FW_META" 2>/dev/null)"
+        	size="$(sed -n 3p "$FW_META" 2>/dev/null)"
+        	log "开始下载固件（服务器体积 ${size:-未知} 字节）"
+        	if ! curl -sL --max-time 1800 -o "$FW_TMP" "$url"; then
+        		echo "error:download-failed" > "$FW_STATE"
+        		log "下载失败：网络中断或链接过期，请重新点击立即更新"
+        		exit 5
+        	fi
+        	got="$(wc -c < "$FW_TMP" 2>/dev/null)"
+        	if [ -z "$got" ] || [ "$got" -lt 5242880 ]; then
+        		echo "error:bad-size" > "$FW_STATE"
+        		log "下载文件异常（体积 ${got:-0}），已终止"
+        		exit 6
+        	fi
+        	echo "verifying" > "$FW_STATE"
+        	log "下载完成（$got 字节），正在校验完整性…"
+        	real="$(sha256sum "$FW_TMP" | awk '{print $1}')"
+        	if [ "$real" != "$sha" ]; then
+        		echo "error:sha-mismatch" > "$FW_STATE"
+        		log "校验失败：文件与服务器不一致，请重新点击立即更新"
+        		exit 7
+        	fi
+        	log "校验通过，即将刷入并重启（保留配置）"
+        	echo "flashing" > "$FW_STATE"
+        	# 调试闸门：存在该文件时只校验不刷入（排查用，正式设备没有此文件）
+        	if [ -f /tmp/tkubeos-fw-noflash ]; then
+        		echo "done-noflash" > "$FW_STATE"
+        		log "调试模式：校验通过，跳过刷入"
+        		exit 0
+        	fi
+        	# 脱离当前会话刷入，避免 sysupgrade 杀进程时把自己杀掉
+        	sleep 2
+        	sysupgrade -r "$FW_TMP"
+        }
+        
+        # 输出当前进度（前端每 2 秒轮询一次）
+        do_status() {
+        	local stage percent detail logtail cur size
+        	stage="$(cat "$FW_STATE" 2>/dev/null)"
+        	[ -n "$stage" ] || stage="idle"
+        	percent=0
+        	detail=""
+        	case "$stage" in
+        	downloading)
+        		cur="$(wc -c < "$FW_TMP" 2>/dev/null)"
+        		[ -n "$cur" ] || cur=0
+        		size="$(sed -n 3p "$FW_META" 2>/dev/null)"
+        		if [ -n "$size" ] && [ "$size" -gt 0 ] 2>/dev/null; then
+        			percent="$(awk -v c="$cur" -v s="$size" 'BEGIN{p=int(c*100/s); if(p>99)p=99; print p}')"
+        			detail="$(awk -v c="$cur" -v s="$size" 'BEGIN{printf "已下载 %.1fMB / %.1fMB", c/1048576, s/1048576}')"
+        		else
+        			detail="$(awk -v c="$cur" 'BEGIN{printf "已下载 %.1fMB", c/1048576}')"
+        		fi
+        		;;
+        	verifying) percent=100; detail="正在校验固件完整性" ;;
+        	flashing) percent=100; detail="校验通过，正在刷入固件并重启" ;;
+        	done-noflash) percent=100; detail="调试模式：校验通过（未刷入）" ;;
+        	error:*) detail="升级失败，请重新点击立即更新" ;;
+        	esac
+        	logtail="$(tail -n 3 "$FW_LOG" 2>/dev/null)"
+        	printf '{"stage":"%s","percent":%s,"detail":"%s","log":"%s"}\n' \
+        		"$stage" "$percent" "$(json_escape "$detail")" "$(json_escape "$logtail")"
+        }
+        
         case "$1" in
         id)
         	machine_id
@@ -261,34 +360,36 @@ jobs:
         	http_check
         	;;
         update)
-        	resp="$(http_check)" || exit 1
-        	auth="$(echo "$resp" | jsonfilter -e '@.authorized' 2>/dev/null)"
-        	[ "$auth" = "true" ] || { echo '{"error":"not-authorized"}'; exit 2; }
-        
-        	has="$(echo "$resp" | jsonfilter -e '@.has_update' 2>/dev/null)"
-        	[ "$has" = "true" ] || { echo '{"error":"no-update"}'; exit 3; }
-        
-        	url="$(echo "$resp" | jsonfilter -e '@.url' 2>/dev/null)"
-        	sha="$(echo "$resp" | jsonfilter -e '@.sha256' 2>/dev/null)"
-        	[ -n "$url" ] && [ -n "$sha" ] || exit 4
-        
-        	rm -f "$FW_TMP"
-        	curl -sL --max-time 900 -o "$FW_TMP" "$url" || exit 5
-        
-        	# 体积校验（>5MB，防空页面/报错页被当作固件；237 底座无 stat，用 wc -c）
-        	size="$(wc -c < "$FW_TMP" 2>/dev/null)"
-        	[ -n "$size" ] && [ "$size" -gt 5242880 ] || exit 6
-        
-        	# sha256 完整性校验
-        	real="$(sha256sum "$FW_TMP" | awk '{print $1}')"
-        	[ "$real" = "$sha" ] || exit 7
-        
-        	# 脱离当前 shell 后台刷入，避免 sysupgrade 杀进程时把自己杀掉
-        	nohup sh -c 'sleep 2; sysupgrade -r /tmp/tkubeos-firmware.bin' >/dev/null 2>&1 &
-        	echo '{"started":true}'
+        	case "$2" in
+        	start)
+        		out="$(prepare_update)"
+        		rc=$?
+        		if [ $rc -ne 0 ]; then
+        			echo "$out"
+        			exit $rc
+        		fi
+        		# 后台工作线程：下载/校验/刷入全在后台，start 立即返回
+        		nohup "$0" _worker >/dev/null 2>&1 &
+        		echo '{"started":true}'
+        		;;
+        	status)
+        		do_status
+        		;;
+        	*)
+        		# 兼容旧调用：同步走完整个流程（命令行调试用；页面走 start+status）
+        		out="$(prepare_update)"
+        		rc=$?
+        		[ $rc -ne 0 ] && { echo "$out"; exit $rc; }
+        		nohup "$0" _worker >/dev/null 2>&1 &
+        		echo '{"started":true}'
+        		;;
+        	esac
+        	;;
+        _worker)
+        	do_worker
         	;;
         *)
-        	echo "Usage: $0 {id|model|ver|check|update}" >&2
+        	echo "Usage: $0 {id|model|ver|check|update start|update status}" >&2
         	exit 1
         	;;
         esac
@@ -301,14 +402,7 @@ jobs:
         'require ui';
         
         var CHECK_SCRIPT = '/usr/sbin/tkubeos-fwcheck';
-        
-        function parseJson(stdout) {
-        	try {
-        		return JSON.parse(stdout.trim());
-        	} catch (e) {
-        		return null;
-        	}
-        }
+        var POLL_MS = 2000;
         
         return view.extend({
         	load: function () {
@@ -326,7 +420,24 @@ jobs:
         		var curVer = (res[1] && res[1].stdout) ? res[1].stdout.trim() : _('读取失败');
         		var model = (res[2] && res[2].stdout) ? res[2].stdout.trim() : 'n60pro';
         
+        		this.pollTimer = null;
+        		this.failCount = 0;
+        
         		this.statusEl = E('div', { 'class': 'alert-message', 'style': 'display:none' });
+        
+        		this.barInner = E('div', {
+        			'style': 'width:0%;height:100%;background:#36a2eb;transition:width .5s;' +
+        				'text-align:center;font-size:11px;line-height:18px;color:#fff;white-space:nowrap'
+        		});
+        		this.barWrap = E('div', {
+        			'style': 'display:none;background:#e4e4e4;border-radius:3px;height:18px;' +
+        				'margin:.6em 0;overflow:hidden'
+        		}, this.barInner);
+        
+        		this.logEl = E('pre', {
+        			'style': 'display:none;background:#f6f6f6;border:1px solid #ddd;padding:.5em;' +
+        				'font-size:12px;max-height:8.5em;overflow:auto;white-space:pre-wrap;margin:.4em 0'
+        		});
         
         		var btnCheck = E('button', {
         			'class': 'btn cbi-button cbi-button-action',
@@ -357,6 +468,8 @@ jobs:
         					])
         				]),
         				this.statusEl,
+        				this.barWrap,
+        				this.logEl,
         				E('div', { 'style': 'margin-top:.5em' }, [btnCheck, ' ', this.btnUpgrade])
         			])
         		]);
@@ -368,10 +481,30 @@ jobs:
         		this.statusEl.textContent = msg;
         	},
         
+        	setBar: function (percent, text) {
+        		this.barWrap.style.display = '';
+        		this.barInner.style.width = percent + '%';
+        		this.barInner.textContent = text;
+        	},
+        
+        	showLog: function (lines) {
+        		if (!lines) return;
+        		this.logEl.style.display = '';
+        		this.logEl.textContent = lines;
+        	},
+        
+        	parseJson: function (stdout) {
+        		try {
+        			return JSON.parse(stdout.trim());
+        		} catch (e) {
+        			return null;
+        		}
+        	},
+        
         	handleCheck: function () {
         		this.setStatus(_('正在检查更新…'));
         		return fs.exec(CHECK_SCRIPT, ['check']).then(L.bind(function (res) {
-        			var r = parseJson(res.stdout);
+        			var r = this.parseJson(res.stdout);
         			if (!r) {
         				this.setStatus(_('检查更新失败：服务器无响应'), 'error');
         				return;
@@ -398,21 +531,85 @@ jobs:
         	handleUpgrade: function () {
         		if (!confirm(_('升级过程中设备将自动重启并短暂断网，期间请勿断电。确定继续？')))
         			return;
+        
         		this.btnUpgrade.disabled = 'disabled';
-        		this.setStatus(_('正在下载并校验固件，请勿断电…'));
-        		return fs.exec(CHECK_SCRIPT, ['update']).then(L.bind(function (res) {
-        			var r = parseJson(res.stdout);
-        			if (res.code !== 0 || !r || !r.started) {
-        				this.setStatus(_('升级启动失败（错误码 ' + res.code + '），请重试'), 'error');
-        				this.btnUpgrade.disabled = null;
+        		this.setBar(2, '');
+        		this.setStatus(_('正在检查授权与更新…'));
+        
+        		return fs.exec(CHECK_SCRIPT, ['update', 'start']).then(L.bind(function (res) {
+        			var r = this.parseJson(res.stdout);
+        			if (res.code !== 0 || !r) {
+        				this.upgradeFail(_('启动失败：无法连接更新服务'));
         				return;
         			}
-        			this.setStatus(_('正在升级，设备即将重启。约 3 分钟后刷新本页面即可。'));
-        			window.setTimeout(function () { location.reload(); }, 180000);
+        			if (r.error) {
+        				var msgs = {
+        					'network': _('网络异常，请检查联网后重试'),
+        					'not-authorized': _('设备未激活，请联系客服开通'),
+        					'no-update': _('当前已是最新版本'),
+        					'bad-response': _('服务器响应异常，请稍后重试')
+        				};
+        				this.upgradeFail(msgs[r.error] || String(r.error));
+        				return;
+        			}
+        			if (!r.started) {
+        				this.upgradeFail(_('启动失败'));
+        				return;
+        			}
+        			this.failCount = 0;
+        			this.setStatus(_('已启动后台下载，进度如下：'));
+        			this.pollTimer = window.setInterval(L.bind(this.pollStatus, this), POLL_MS);
         		}, this)).catch(L.bind(function () {
-        			this.setStatus(_('升级启动失败，请重试'), 'error');
-        			this.btnUpgrade.disabled = null;
+        			this.upgradeFail(_('启动失败：请求超时或被拒绝'));
         		}, this));
+        	},
+        
+        	pollStatus: function () {
+        		fs.exec(CHECK_SCRIPT, ['update', 'status']).then(L.bind(function (res) {
+        			var r = this.parseJson(res.stdout);
+        			if (!r) return;
+        			this.failCount = 0;
+        			if (r.log) this.showLog(r.log);
+        
+        			switch (r.stage) {
+        			case 'downloading':
+        				this.setBar(r.percent || 2, (r.percent || 0) + '%');
+        				this.setStatus(_('正在下载固件：') + (r.detail || ''));
+        				break;
+        			case 'verifying':
+        				this.setBar(100, '100%');
+        				this.setStatus(_('下载完成，正在校验固件完整性…'));
+        				break;
+        			case 'flashing':
+        				window.clearInterval(this.pollTimer);
+        				this.setBar(100, '100%');
+        				this.setStatus(_('校验通过，正在刷入固件并重启。约 3 分钟后刷新本页面即可。'));
+        				window.setTimeout(function () { location.reload(); }, 180000);
+        				break;
+        			case 'done-noflash':
+        				window.clearInterval(this.pollTimer);
+        				this.setBar(100, '100%');
+        				this.setStatus(_('调试模式：固件校验通过，未刷入'));
+        				this.btnUpgrade.disabled = null;
+        				break;
+        			default:
+        				if (r.stage && r.stage.indexOf('error') === 0) {
+        					this.upgradeFail(r.detail || _('升级失败，请重新点击立即更新'));
+        				}
+        			}
+        		}, this)).catch(L.bind(function () {
+        			// 刷入重启期间通信会短暂中断，多容忍几次再判失败
+        			this.failCount++;
+        			if (this.failCount > 10) {
+        				this.upgradeFail(_('与设备的通信中断，请刷新页面查看结果'));
+        			}
+        		}, this));
+        	},
+        
+        	upgradeFail: function (msg) {
+        		window.clearInterval(this.pollTimer);
+        		this.setStatus(msg, 'error');
+        		this.btnUpgrade.disabled = null;
         	}
         });
         JSEOF

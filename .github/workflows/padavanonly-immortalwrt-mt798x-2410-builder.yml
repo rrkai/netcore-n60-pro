@@ -133,18 +133,31 @@ jobs:
         exit 0
         XRAYEOF
         chmod +x $GITHUB_WORKSPACE/files/etc/uci-defaults/97-upgrade-xray
-        # ===== 移除 ttyd 网页终端 =====
+        # ===== ttyd 服务禁用脚本（兜底）=====
+        # 万一仍有依赖路径把 ttyd 守护进程带进固件，首启时禁用并停止其 init，
+        # 确保 7681 端口的网页终端不会运行（与下面删默认包、config not set 构成三重保险）。
+        cat > $GITHUB_WORKSPACE/files/etc/uci-defaults/98-disable-ttyd <<'TTYDEOF'
+        #!/bin/sh
+        if [ -x /etc/init.d/ttyd ]; then
+        	/etc/init.d/ttyd disable 2>/dev/null
+        	/etc/init.d/ttyd stop 2>/dev/null
+        	logger -t tkubeos "ttyd init disabled and stopped"
+        fi
+        exit 0
+        TTYDEOF
+        chmod +x $GITHUB_WORKSPACE/files/etc/uci-defaults/98-disable-ttyd
+        # ===== 移除 ttyd 网页终端全家（守护进程 + LuCI 应用 + 中文包）=====
         # 6.6 分支底座把 luci-app-ttyd 写死在 target/linux/mediatek/Makefile 的 DEFAULT_PACKAGES 里，
         # DEFAULT_PACKAGES 是无条件安装（不走 Kconfig），config 里 "is not set" 拦不住。
         # 2410 分支的该文件没有 ttyd 条目，sed 不匹配无副作用，保留此段保证两线行为一致。
         # 只删包名不删整行：同一行还有其他默认包。
-        sed -i 's/luci-app-ttyd //' target/linux/mediatek/Makefile
-        echo "########## 验证：ttyd 已从默认包移除 ##########"
-        if grep -q 'luci-app-ttyd' target/linux/mediatek/Makefile; then
-          echo "!!! 警告：ttyd 仍残留于默认包清单 !!!"
-          grep -n 'luci-app-ttyd' target/linux/mediatek/Makefile
+        # 删除顺序：先长名（i18n/app）后短名，避免 \b 词边界把 luci-app-ttyd 的尾巴误伤。
+        sed -i -e 's/luci-i18n-ttyd-zh-cn //g' -e 's/luci-app-ttyd //g' -e 's/\bttyd\b//g' target/linux/mediatek/Makefile
+        echo "########## 验证：ttyd 全家已从默认包移除 ##########"
+        if grep -n 'ttyd' target/linux/mediatek/Makefile; then
+          echo "!!! 警告：ttyd 相关条目仍残留于 mediatek Makefile !!!"
         else
-          echo "确认：默认包已无 ttyd（2410 底座本就没有，正常）"
+          echo "确认：默认包已无任何 ttyd 条目（2410 底座本就没有，正常）"
         fi
         # ===== 钉死 luci-app-passwall 版本为 26.8.26-1 =====
         # feeds update 后 passwall feed 停在 main 最新，checkout 到 tag 钉住版本，
@@ -187,18 +200,41 @@ jobs:
         rm -rf package/feeds/luci/luci-app-passwall package/feeds/luci/luci-i18n-passwall-zh-cn
         echo "########## 验证：passwall 包来源（必须指向 feeds/passwall）##########"
         ls -l package/feeds/*/luci-app-passwall || echo "!!! 严重警告：passwall 包未安装，固件将缺少 PassWall !!!"
+        # ===== 屏蔽系统自带「备份/升级」（flashops）菜单入口 =====
+        # 固件升级走 TKubeOS 自有「固件更新」页（授权 + 钉版本），配置备份走该页「生成备份」按钮。
+        # 自带页可绕过授权刷任意镜像/恢复任意备份，必须从菜单摘除入口。
+        # 做法：从 luci-mod-admin-full 的 menu.d JSON 删掉 admin/system/flashops 条目
+        # （视图文件保留，界面无入口）；用 python3 改 JSON，避免 sed 破坏结构。
+        FLASHOPS_JSON="$(find feeds/luci -path '*menu.d/luci-mod-admin-full.json' 2>/dev/null | head -1)"
+        if [ -n "$FLASHOPS_JSON" ]; then
+          python3 - "$FLASHOPS_JSON" <<'PYEOF'
+        import json, sys
+        p = sys.argv[1]
+        with open(p, encoding='utf-8') as f:
+            d = json.load(f)
+        removed = d.pop('admin/system/flashops', None)
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump(d, f, indent='\t', ensure_ascii=False)
+            f.write('\n')
+        print('flashops entry removed:', removed is not None)
+        PYEOF
+        else
+          echo "!!! 警告：未找到 luci-mod-admin-full.json，自带备份/升级页入口未屏蔽 !!!"
+        fi
+        echo "########## 验证：flashops 菜单条目残留（应为 0）##########"
+        if [ -n "$FLASHOPS_JSON" ]; then grep -c 'admin/system/flashops' "$FLASHOPS_JSON" || true; fi
 
     - name: Generate TKubeOS online update files
       run: |
         # ===== TKubeOS 在线更新功能（授权制，服务端 https://upfw.tkubeos.com）=====
-        # LuCI“系统→固件更新”页面：显示机器号/型号/当前版本，检查授权与新版；
+        # LuCI“系统→固件更新”页面：显示机器号/型号/当前版本，检查授权与新版，“生成备份”下载当前配置 tar.gz；
         # “立即更新”= update start 立即返回 + 后台下载/校验/刷入，前端每 2 秒轮询
         # update status 渲染进度条与日志（旧版同步 exec 会在下载期间触发 RPC 超时“启动失败”）。
         # 版本/型号标识放 /usr/share/tkubeos/（每次刷机被新镜像覆盖，身份永远正确；
         # 放 /etc 会被 sysupgrade -c 保留旧值，形成“永远有更新”死循环——09/01 实锤）。
         # 刷入用 sysupgrade -c（保留配置）；本底座 -r 是恢复备份语义，带镜像会被拒绝。
         # 所有文件编译时由 heredoc 生成，随固件打包。依赖：curl（PassWall 带入）、
-        # jsonfilter / md5sum / sha256sum（底座自带），均无需加包。
+        # jsonfilter / md5sum / sha256sum（底座自带）、base64（config 已显式开启的 busybox 组件），均无需加包。
         mkdir -p $GITHUB_WORKSPACE/files/usr/sbin
         mkdir -p $GITHUB_WORKSPACE/files/www/luci-static/resources/view/tkubeos
         mkdir -p $GITHUB_WORKSPACE/files/usr/share/luci/menu.d
@@ -207,7 +243,7 @@ jobs:
         cat > $GITHUB_WORKSPACE/files/usr/sbin/tkubeos-fwcheck <<'FWEOF'
         #!/bin/sh
         # TKubeOS 固件更新助手（由 LuCI 页面调用）
-        # 用法: tkubeos-fwcheck {id|model|ver|check|update start|update status}
+        # 用法: tkubeos-fwcheck {id|model|ver|check|update start|update status|backup start|backup read|backup clean}
         #   id            输出设备机器号（MAC 的 md5）
         #   model         输出设备型号（读 /etc/tkubeos_model，编译时写入）
         #   ver           输出当前固件版本
@@ -215,6 +251,9 @@ jobs:
         #   update start  启动后台升级线程（零网络、立即返回；授权查询/下载/刷入全在后台，前端轮询 status 拿进度）
         #   update status 输出进度 JSON：{stage, percent, detail, log}
         #   update        （不带子命令=旧版同步模式，仅命令行调试用）
+        #   backup start  生成当前配置备份（sysupgrade -b → /tmp 的 tar.gz），输出 {"size":N}
+        #   backup read   读取备份分片：backup read <分片号从0起> <分片字节数>，输出该分片 base64
+        #   backup clean  删除备份临时文件（前端下载完成后调用）
         
         # 授权更新服务地址（与服务端 config.php 的 API_DOMAIN 一致）
         API_BASE="https://upfw.tkubeos.com"
@@ -222,6 +261,9 @@ jobs:
         FW_STATE="/tmp/tkubeos-fw-state"
         FW_META="/tmp/tkubeos-fw-meta"
         FW_LOG="/tmp/tkubeos-fw.log"
+        # 配置备份临时文件（tmpfs 重启即失；下载完由前端调 backup clean 主动清理。
+        # 绝不落盘 /www：备份含密码与密钥，不能经静态 URL 暴露）
+        BK_TMP="/tmp/tkubeos-backup.tar.gz"
         
         log() { echo "$(date '+%m-%d %H:%M:%S') $*" >> "$FW_LOG"; }
         
@@ -419,11 +461,41 @@ jobs:
         		;;
         	esac
         	;;
+        backup)
+        	# 配置备份：sysupgrade -b 打 tar.gz，前端按 32KB 分片 base64 读走拼 Blob 下载。
+        	# 分片读取是为绕开 ubus 单条消息对超大 stdout 的限制（整包一次性输出会截断/失败）。
+        	case "$2" in
+        	start)
+        		rm -f "$BK_TMP"
+        		sysupgrade -b "$BK_TMP" >/dev/null 2>&1
+        		if [ -s "$BK_TMP" ]; then
+        			echo "{\"size\":$(wc -c < "$BK_TMP")}"
+        		else
+        			echo '{"error":"backup-failed"}'
+        			exit 1
+        		fi
+        		;;
+        	read)
+        		# $3=分片号（从 0 起） $4=分片字节数；dd 定长块 skip 定位，base64 压成单行
+        		[ -f "$BK_TMP" ] || { echo '{"error":"no-backup"}'; exit 1; }
+        		dd if="$BK_TMP" bs="$4" skip="$3" count=1 2>/dev/null | base64 | tr -d '\n'
+        		echo
+        		;;
+        	clean)
+        		rm -f "$BK_TMP"
+        		echo '{"cleaned":true}'
+        		;;
+        	*)
+        		echo "Usage: $0 backup {start|read <idx> <size>|clean}" >&2
+        		exit 1
+        		;;
+        	esac
+        	;;
         _worker)
         	do_worker
         	;;
         *)
-        	echo "Usage: $0 {id|model|ver|check|update start|update status}" >&2
+        	echo "Usage: $0 {id|model|ver|check|update start|update status|backup start|backup read|backup clean}" >&2
         	exit 1
         	;;
         esac
@@ -478,6 +550,11 @@ jobs:
         			'click': ui.createHandlerFn(this, 'handleCheck')
         		}, [_('检查更新')]);
         
+        		this.btnBackup = E('button', {
+        			'class': 'btn cbi-button',
+        			'click': ui.createHandlerFn(this, 'handleBackup')
+        		}, [_('生成备份')]);
+        
         		this.btnUpgrade = E('button', {
         			'class': 'btn cbi-button cbi-button-positive important',
         			'disabled': 'disabled',
@@ -504,7 +581,7 @@ jobs:
         				this.statusEl,
         				this.barWrap,
         				this.logEl,
-        				E('div', { 'style': 'margin-top:.5em' }, [btnCheck, ' ', this.btnUpgrade])
+        				E('div', { 'style': 'margin-top:.5em' }, [btnCheck, ' ', this.btnBackup, ' ', this.btnUpgrade])
         			])
         		]);
         	},
@@ -560,6 +637,63 @@ jobs:
         		}, this)).catch(L.bind(function () {
         			this.setStatus(_('检查更新失败，请稍后重试'), 'error');
         		}, this));
+        	},
+        
+        	handleBackup: function () {
+        		// 生成备份 = 本地 sysupgrade -b 打 tar.gz，前端按 32KB 分片 base64 读回，
+        		// 拼成 Blob 触发浏览器下载；完成后调 backup clean 删除临时文件。
+        		// 全程走 ACL 允许的 fwcheck exec，不经静态 URL，配置密码不外泄。
+        		var CHUNK = 32768;
+        		var self = this;
+        		this.btnBackup.disabled = 'disabled';
+        		this.logEl.style.display = 'none';
+        		this.setBar(1, '');
+        		this.setStatus(_('正在生成配置备份…'));
+        		return fs.exec(CHECK_SCRIPT, ['backup', 'start']).then(function (res) {
+        			var r = self.parseJson(res.stdout);
+        			if (res.code !== 0 || !r || !r.size)
+        				throw new Error('backup-start-failed');
+        			var total = r.size, parts = [], idx = 0;
+        			function nextChunk() {
+        				if (idx * CHUNK >= total)
+        					return Promise.resolve();
+        				return fs.exec(CHECK_SCRIPT, ['backup', 'read', String(idx), String(CHUNK)]).then(function (res2) {
+        					var b64 = (res2.stdout || '').trim();
+        					if (!b64 || b64.charAt(0) === '{')
+        						throw new Error('backup-read-failed');
+        					var bin = atob(b64), buf = new Uint8Array(bin.length);
+        					for (var i = 0; i < bin.length; i++)
+        						buf[i] = bin.charCodeAt(i);
+        					parts.push(buf);
+        					idx++;
+        					self.setBar(Math.min(99, Math.floor(idx * CHUNK * 100 / total)), '');
+        					self.setStatus(_('正在导出备份：') + Math.min(idx * CHUNK, total) + ' / ' + total + ' 字节');
+        					return nextChunk();
+        				});
+        			}
+        			return nextChunk().then(function () {
+        				return fs.exec(CHECK_SCRIPT, ['backup', 'clean']);
+        			}).then(function () {
+        				var blob = new Blob(parts, { type: 'application/gzip' });
+        				var d = new Date();
+        				var pad = function (n) { return (n < 10 ? '0' : '') + n; };
+        				var name = 'tkubeos-backup-' + d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) +
+        					'-' + pad(d.getHours()) + pad(d.getMinutes()) + '.tar.gz';
+        				var a = E('a', { href: URL.createObjectURL(blob), download: name });
+        				document.body.appendChild(a);
+        				a.click();
+        				document.body.removeChild(a);
+        				setTimeout(function () { URL.revokeObjectURL(a.href); }, 30000);
+        				self.barWrap.style.display = 'none';
+        				self.setStatus(_('备份已生成并开始下载：') + name + '（' + total + ' 字节）');
+        				self.btnBackup.disabled = null;
+        			});
+        		}).catch(function () {
+        			fs.exec(CHECK_SCRIPT, ['backup', 'clean']);
+        			self.barWrap.style.display = 'none';
+        			self.setStatus(_('生成备份失败，请重试'), 'error');
+        			self.btnBackup.disabled = null;
+        		});
         	},
         
         	handleUpgrade: function () {
@@ -694,9 +828,17 @@ jobs:
         # 型号标识决定服务端从 files/<型号>/ 目录分发固件，两条线都是 N60PRO 设备，均为 n60pro。
         echo "$(date +%Y.%m.%d.%H%M)" > $GITHUB_WORKSPACE/files/usr/share/tkubeos/version
         echo "n60pro" > $GITHUB_WORKSPACE/files/usr/share/tkubeos/model
+        # 版本号当场固化到 GITHUB_ENV：后续 Load custom configuration 步骤会把 files/ 并入
+        # openwrt/ 源码树并 rm -rf files，发布步骤再按原路径 cat 必然落空，
+        # Release 就会显示“固件版本：未知”（实锤 bug，改用环境变量跨步骤传递）。
+        echo "TKUBEOS_VERSION=$(cat $GITHUB_WORKSPACE/files/usr/share/tkubeos/version)" >> $GITHUB_ENV
         echo "########## 验证：TKubeOS 在线更新文件（应为 6 个；版本号为 年.月.日.时分 格式）##########"
         ls -l $GITHUB_WORKSPACE/files/usr/sbin/tkubeos-fwcheck $GITHUB_WORKSPACE/files/www/luci-static/resources/view/tkubeos/update.js $GITHUB_WORKSPACE/files/usr/share/luci/menu.d/luci-app-tkubeos-update.json $GITHUB_WORKSPACE/files/usr/share/rpcd/acl.d/tkubeos-update.json $GITHUB_WORKSPACE/files/usr/share/tkubeos/version $GITHUB_WORKSPACE/files/usr/share/tkubeos/model
         echo "version: $(cat $GITHUB_WORKSPACE/files/usr/share/tkubeos/version)  model: $(cat $GITHUB_WORKSPACE/files/usr/share/tkubeos/model)"
+        echo "########## 验证：备份功能注入（backup case 应为 1；handleBackup 应为 2）与 ttyd 禁用脚本 ##########"
+        grep -c '^backup)' $GITHUB_WORKSPACE/files/usr/sbin/tkubeos-fwcheck
+        grep -c 'handleBackup' $GITHUB_WORKSPACE/files/www/luci-static/resources/view/tkubeos/update.js
+        ls -l $GITHUB_WORKSPACE/files/etc/uci-defaults/98-disable-ttyd
 
     - name: Load custom configuration
       run: |
@@ -789,10 +931,10 @@ jobs:
         cat > release.txt <<EOF
         ### TKubeOS · Netcore N60 PRO 定制固件（237 2410线 / 5.4内核）
         - 构建时间：$(date +"%Y-%m-%d %H:%M")
-        - 固件版本：$(cat $GITHUB_WORKSPACE/files/usr/share/tkubeos/version 2>/dev/null || echo 未知)
+        - 固件版本：${TKUBEOS_VERSION:-未知}
         - 默认地址：192.168.1.1 | root 密码：www666
         - WiFi：TKubeOS-2.4G / TKubeOS-5G
-        - 在线更新：LuCI「系统 → 固件更新」（激活设备可一键检查并升级）
+        - 在线更新：LuCI「系统 → 固件更新」（激活设备可一键检查并升级，「生成备份」导出当前配置）
         EOF
         echo "status=success" >> $GITHUB_OUTPUT
 

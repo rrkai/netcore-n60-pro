@@ -200,29 +200,33 @@ jobs:
         rm -rf package/feeds/luci/luci-app-passwall package/feeds/luci/luci-i18n-passwall-zh-cn
         echo "########## 验证：passwall 包来源（必须指向 feeds/passwall）##########"
         ls -l package/feeds/*/luci-app-passwall || echo "!!! 严重警告：passwall 包未安装，固件将缺少 PassWall !!!"
-        # ===== 屏蔽系统自带「备份/升级」（flashops）菜单入口 =====
+        # ===== 屏蔽系统自带「备份 / 刷写固件」菜单入口 =====
         # 固件升级走 TKubeOS 自有「固件更新」页（授权 + 钉版本），配置备份走该页「生成备份」按钮。
         # 自带页可绕过授权刷任意镜像/恢复任意备份，必须从菜单摘除入口。
-        # 做法：从 luci-mod-admin-full 的 menu.d JSON 删掉 admin/system/flashops 条目
-        # （视图文件保留，界面无入口）；用 python3 改 JSON，避免 sed 破坏结构。
-        FLASHOPS_JSON="$(find feeds/luci -path '*menu.d/luci-mod-admin-full.json' 2>/dev/null | head -1)"
-        if [ -n "$FLASHOPS_JSON" ]; then
-          python3 - "$FLASHOPS_JSON" <<'PYEOF'
-        import json, sys
-        p = sys.argv[1]
-        with open(p, encoding='utf-8') as f:
-            d = json.load(f)
-        removed = d.pop('admin/system/flashops', None)
-        with open(p, 'w', encoding='utf-8') as f:
-            json.dump(d, f, indent='\t', ensure_ascii=False)
-            f.write('\n')
-        print('flashops entry removed:', removed is not None)
+        # 09/02 实锤：新版 luci（26.x）已无 luci-mod-admin-full.json，菜单拆分到
+        # luci-mod-system.json 等文件，且键名是 admin/system/flash（旧版为 flashops）。
+        # 改为扫描全部 modules 的 menu.d JSON，两种键名都删；python3 改 JSON 不破坏结构。
+        python3 - <<'PYEOF'
+        import json, glob
+        keys = ('admin/system/flashops', 'admin/system/flash')
+        paths = sorted(glob.glob('feeds/luci/modules/*/root/usr/share/luci/menu.d/*.json'))
+        if not paths:
+            print('!!! 警告：feeds/luci/modules 下未找到任何 menu.d JSON，自带备份/升级页未屏蔽 !!!')
+        for p in paths:
+            with open(p, encoding='utf-8') as f:
+                d = json.load(f)
+            hit = [k for k in keys if k in d]
+            if not hit:
+                continue
+            for k in hit:
+                d.pop(k)
+            with open(p, 'w', encoding='utf-8') as f:
+                json.dump(d, f, indent='\t', ensure_ascii=False)
+                f.write('\n')
+            print('removed', hit, 'from', p)
         PYEOF
-        else
-          echo "!!! 警告：未找到 luci-mod-admin-full.json，自带备份/升级页入口未屏蔽 !!!"
-        fi
-        echo "########## 验证：flashops 菜单条目残留（应为 0）##########"
-        if [ -n "$FLASHOPS_JSON" ]; then grep -c 'admin/system/flashops' "$FLASHOPS_JSON" || true; fi
+        echo "########## 验证：自带备份/升级菜单条目残留（应为 0）##########"
+        grep -rn '"admin/system/flash' feeds/luci/modules/*/root/usr/share/luci/menu.d/ 2>/dev/null && echo "!!! 警告：admin/system/flash* 条目仍残留 !!!" || echo "确认：menu.d 已无 flash/flashops 条目"
 
     - name: Generate TKubeOS online update files
       run: |
@@ -855,6 +859,22 @@ jobs:
       id: package
       run: |
         cd openwrt
+        # ===== 编译前最后一道防线：全树清除 ttyd（含硬依赖）=====
+        # 09/02 设备端实锤真根因：luci-app-turboacc-mtk（MTK 厂商加速 app，config 选中）
+        # 的 DEPENDS 带 +luci-app-ttyd 硬依赖，“+”前缀在 make defconfig 时强制选中，
+        # config “is not set” 直接被推翻，连带拉进 ttyd 守护进程与中文包。
+        # （DEFAULT_PACKAGES 的 sed 与 98-disable-ttyd 兜底都对，但都拦不住“+”依赖。）
+        # 修法：make defconfig 前扫掉 package/、feeds/ 全部 Makefile 里的 +luci-app-ttyd、
+        # +ttyd 依赖记号，再对 target/linux 做 DEFAULT_PACKAGES/DEVICE_PACKAGES 清扫。
+        grep -rl --include='Makefile' -e '+luci-app-ttyd' -e '+ttyd\b' package/ feeds/ 2>/dev/null | xargs -r sed -i -e 's/+luci-app-ttyd//g' -e 's/+ttyd\b//g'
+        grep -rlE --include='Makefile' --include='*.mk' '\bttyd\b' target/linux/ 2>/dev/null | xargs -r sed -i -e 's/luci-i18n-ttyd-zh-cn //g' -e 's/luci-app-ttyd //g' -e 's/\bttyd\b//g'
+        echo "########## 验证：ttyd 硬依赖与默认包残留（均应为空）##########"
+        grep -rn --include='Makefile' -e '+luci-app-ttyd' -e '+ttyd\b' package/ feeds/ 2>/dev/null && echo "!!! 警告：仍有包硬依赖 ttyd，固件将带网页终端 !!!" || echo "确认：package/feeds 已无 +ttyd 系硬依赖"
+        if grep -rnE --include='Makefile' --include='*.mk' '\bttyd\b' target/linux/ 2>/dev/null; then
+          echo "!!! 警告：target/linux 下仍残留 ttyd 条目 !!!"
+        else
+          echo "确认：target/linux 全树已无 ttyd 条目"
+        fi
         make defconfig
         echo "########## 诊断：目标设备选择 ##########"
         grep -E '^CONFIG_TARGET_DEVICE.*=y' .config || echo "!!! 警告：未选中任何设备，固件将不会生成 !!!"

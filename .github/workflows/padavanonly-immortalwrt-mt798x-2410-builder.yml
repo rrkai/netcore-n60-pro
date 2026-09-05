@@ -18,6 +18,9 @@ env:
   CONFIG_FILE: padavanonly-immortalwrt-mt798x-2410.config
   DIY_P1_SH: diy-part1.sh
   DIY_P2_SH: diy-part5-2410.sh
+  # 界面主题仓库（如需换成带 CSS 定制的 fork/tag，只改下面两行）
+  THEME_SHADCN_REPO: https://github.com/eamonxg/luci-theme-shadcn
+  THEME_FOOTSTRAP_REPO: https://github.com/VizzleTF/luci-theme-footstrap
   UPLOAD_BIN_DIR: false
   UPLOAD_FIRMWARE: true
   UPLOAD_RELEASE: true
@@ -146,6 +149,17 @@ jobs:
         exit 0
         TTYDEOF
         chmod +x $GITHUB_WORKSPACE/files/etc/uci-defaults/98-disable-ttyd
+        # ===== 出厂默认主题 = shadcn =====
+        # 各主题自带的注册脚本（30_*）先跑，本脚本编号最大最后跑，对 mediaurlbase
+        # 拥有“最后一句话”；sysupgrade -c 后新固件首启会重跑本脚本，默认主题恒为
+        # shadcn；用户仍可在「系统→系统→语言和界面」临时切到 footstrap。
+        cat > $GITHUB_WORKSPACE/files/etc/uci-defaults/99-set-default-theme <<'THEMEEOF'
+        #!/bin/sh
+        uci set luci.main.mediaurlbase='/luci-static/shadcn'
+        uci commit luci
+        exit 0
+        THEMEEOF
+        chmod +x $GITHUB_WORKSPACE/files/etc/uci-defaults/99-set-default-theme
         # ===== 移除 ttyd 网页终端全家（守护进程 + LuCI 应用 + 中文包）=====
         # 6.6 分支底座把 luci-app-ttyd 写死在 target/linux/mediatek/Makefile 的 DEFAULT_PACKAGES 里，
         # DEFAULT_PACKAGES 是无条件安装（不走 Kconfig），config 里 "is not set" 拦不住。
@@ -839,10 +853,11 @@ jobs:
         echo "########## 验证：TKubeOS 在线更新文件（应为 6 个；版本号为 年.月.日.时分 格式）##########"
         ls -l $GITHUB_WORKSPACE/files/usr/sbin/tkubeos-fwcheck $GITHUB_WORKSPACE/files/www/luci-static/resources/view/tkubeos/update.js $GITHUB_WORKSPACE/files/usr/share/luci/menu.d/luci-app-tkubeos-update.json $GITHUB_WORKSPACE/files/usr/share/rpcd/acl.d/tkubeos-update.json $GITHUB_WORKSPACE/files/usr/share/tkubeos/version $GITHUB_WORKSPACE/files/usr/share/tkubeos/model
         echo "version: $(cat $GITHUB_WORKSPACE/files/usr/share/tkubeos/version)  model: $(cat $GITHUB_WORKSPACE/files/usr/share/tkubeos/model)"
-        echo "########## 验证：备份功能注入（backup case 应为 1；handleBackup 应为 2）与 ttyd 禁用脚本 ##########"
+        echo "########## 验证：备份功能注入（backup case 应为 1；handleBackup 应为 2）与 ttyd 禁用/默认主题脚本 ##########"
         grep -c '^backup)' $GITHUB_WORKSPACE/files/usr/sbin/tkubeos-fwcheck
         grep -c 'handleBackup' $GITHUB_WORKSPACE/files/www/luci-static/resources/view/tkubeos/update.js
         ls -l $GITHUB_WORKSPACE/files/etc/uci-defaults/98-disable-ttyd
+        ls -l $GITHUB_WORKSPACE/files/etc/uci-defaults/99-set-default-theme
 
     - name: Load custom configuration
       run: |
@@ -875,6 +890,46 @@ jobs:
         else
           echo "确认：target/linux 全树已无 ttyd 条目"
         fi
+        # ===== 克隆两个定制主题进 package/（必须在 make defconfig 之前，CONFIG 符号才会生成）=====
+        # shadcn：仓库根目录即包（Makefile+htdocs+ucode，PKG_VERSION 已硬编码）。
+        # footstrap：包在仓库子目录 luci-theme-footstrap/，其 Build/Prepare 只用 cat/awk/sed
+        # （上游明确支持无 node 环境构建）；版本号靠 FOOTSTRAP_VERSION 注入（空值有边界风险），
+        # 从克隆的 git 头提交日期派生，经 GITHUB_ENV 传给后续编译步骤。
+        # 如需换成带 CSS 定制的 fork/tag，只改文件头 env 的两个 THEME_*_REPO 即可。
+        rm -rf package/tkubeos-themes /tmp/footstrap-src
+        mkdir -p package/tkubeos-themes
+        git clone --depth 1 $THEME_SHADCN_REPO package/tkubeos-themes/luci-theme-shadcn
+        git clone --depth 1 $THEME_FOOTSTRAP_REPO /tmp/footstrap-src
+        cp -a /tmp/footstrap-src/luci-theme-footstrap package/tkubeos-themes/luci-theme-footstrap
+        echo "FOOTSTRAP_VERSION=$(git -C /tmp/footstrap-src log -1 --format=%cd --date=format:%Y%m%d)-tkubeos" >> $GITHUB_ENV
+        echo "########## 验证：主题包就位（应为 2 个 Makefile）##########"
+        ls -l package/tkubeos-themes/luci-theme-shadcn/Makefile package/tkubeos-themes/luci-theme-footstrap/Makefile
+        # ===== 设置向导挪进「系统」一级导航 =====
+        # 原菜单键是顶层 admin/netwizard（09/05 设备端实锤），整条搬到 admin/system/netwizard，
+        # order=3 排在「系统」子菜单靠前位置；title/acl 依赖原样保留（中文标题由 i18n 包翻译）。
+        NETWIZARD_JSON="$(find -L package feeds -path '*menu.d/luci-app-netwizard.json' 2>/dev/null | head -1)"
+        if [ -n "$NETWIZARD_JSON" ]; then
+          python3 - "$NETWIZARD_JSON" <<'PYEOF'
+        import json, sys
+        p = sys.argv[1]
+        with open(p, encoding='utf-8') as f:
+            d = json.load(f)
+        entry = d.pop('admin/netwizard', None)
+        if entry is None:
+            print('admin/netwizard 不存在（可能上游已改结构），现有键：', list(d.keys()))
+        else:
+            entry['order'] = 3
+            d['admin/system/netwizard'] = entry
+            with open(p, 'w', encoding='utf-8') as f:
+                json.dump(d, f, indent='\t', ensure_ascii=False)
+                f.write('\n')
+            print('netwizard 菜单已移至 admin/system/netwizard:', p)
+        PYEOF
+        else
+          echo "!!! 警告：未找到 luci-app-netwizard.json，向导菜单位置未调整 !!!"
+        fi
+        echo "########## 验证：向导菜单键（应为 admin/system/netwizard）##########"
+        grep -o '"admin/[a-z/]*netwizard"' "${NETWIZARD_JSON:-/dev/null}" || true
         make defconfig
         echo "########## 诊断：目标设备选择 ##########"
         grep -E '^CONFIG_TARGET_DEVICE.*=y' .config || echo "!!! 警告：未选中任何设备，固件将不会生成 !!!"
@@ -882,6 +937,8 @@ jobs:
         grep -E 'SHADOWSOCKS_RUST|PACKAGE_rust|TUIC_CLIENT|SHADOW_TLS|DNS2SOCKS_RUST' .config | grep -v 'not set' || echo "无 rust 系包被选中"
         echo "########## 诊断：关键插件选中状态 ##########"
         grep -E '^CONFIG_PACKAGE_(luci-app-passwall|luci-app-ssr-plus|luci-app-homeproxy|luci-app-netwizard|sing-box)=y' .config || echo "!!! 警告：没有任何代理插件被选中，请检查 config 和 feed !!!"
+        echo "########## 诊断：主题选中状态（应见 shadcn/footstrap=y，不应见 argon/bootstrap-mod）##########"
+        grep -E '^CONFIG_PACKAGE_luci-theme-.*=y' .config || echo "!!! 警告：没有任何主题被选中，LuCI 将无法正常渲染 !!!"
         echo "########## 诊断：固件版本标识（品牌化）##########"
         grep -E '^CONFIG_(IMAGEOPT|VERSIONOPT|VERSION_DIST|VERSION_MANUFACTURER|VERSION_PRODUCT)=' .config || echo "!!! 警告：品牌化配置被 defconfig 丢弃，固件将显示 ImmortalWrt !!!"
         echo "########## 诊断：TKubeOS 在线更新文件已并入源码树 ##########"
@@ -954,6 +1011,7 @@ jobs:
         - 固件版本：${TKUBEOS_VERSION:-未知}
         - 默认地址：192.168.1.1 | root 密码：www666
         - WiFi：TKubeOS-2.4G / TKubeOS-5G
+        - 界面主题：shadcn（默认）/ footstrap（系统→系统→语言和界面 可切换）
         - 在线更新：LuCI「系统 → 固件更新」（激活设备可一键检查并升级，「生成备份」导出当前配置）
         EOF
         echo "status=success" >> $GITHUB_OUTPUT

@@ -18,8 +18,9 @@ env:
   CONFIG_FILE: padavanonly-immortalwrt-mt798x-2410.config
   DIY_P1_SH: diy-part1.sh
   DIY_P2_SH: diy-part5-2410.sh
-  # 界面主题仓库（如需换成带 CSS 定制的 fork/tag，只改下面两行）
-  THEME_SHADCN_REPO: https://github.com/eamonxg/luci-theme-shadcn
+  # 界面主题仓库：shadcn 用自有 fork（预留 CSS 定制位）；待 fork 提交定制并打 tag（如 tkubeos-1.0）后，
+  # 可在下方克隆命令追加 -b <tag> 锁定版本
+  THEME_SHADCN_REPO: https://github.com/rrkai/luci-theme-shadcn
   THEME_FOOTSTRAP_REPO: https://github.com/VizzleTF/luci-theme-footstrap
   UPLOAD_BIN_DIR: false
   UPLOAD_FIRMWARE: true

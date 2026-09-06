@@ -150,12 +150,24 @@ jobs:
         exit 0
         TTYDEOF
         chmod +x $GITHUB_WORKSPACE/files/etc/uci-defaults/98-disable-ttyd
-        # ===== 出厂默认主题 = shadcn =====
+        # ===== 出厂默认主题 = shadcn + 幽灵主题清理 =====
         # 各主题自带的注册脚本（30_*）先跑，本脚本编号最大最后跑，对 mediaurlbase
         # 拥有“最后一句话”；sysupgrade -c 后新固件首启会重跑本脚本，默认主题恒为
         # shadcn；用户仍可在「系统→系统→语言和界面」临时切到 footstrap。
+        # 09/06 实锤：sysupgrade -c 保留旧 /etc/config/luci，已卸载主题（如 Argon）的
+        # 注册项会残留在主题下拉框里当“幽灵条目”，故先清除目录已不存在的注册再设默认。
         cat > $GITHUB_WORKSPACE/files/etc/uci-defaults/99-set-default-theme <<'THEMEEOF'
         #!/bin/sh
+        # 清除目录已不存在的主题注册（-c 升级遗留），只处理包含 /luci-static/ 路径的选项行，
+        # 绝不碰 luci.themes=internal 这种节声明行。
+        # 注意：取值用 uci get，不用 ${line#*='} 这种带引号的参数展开模式——
+        # BusyBox ash 对模式内单引号解析异常（09/06 实锤：展开失效导致误删正常主题）。
+        uci -q show luci.themes 2>/dev/null | while IFS= read -r line; do
+        	case "$line" in *"/luci-static/"*) ;; *) continue ;; esac
+        	key="${line%%=*}"
+        	val="$(uci -q get "$key")"
+        	[ -n "$val" ] && { [ -d "/www$val" ] || uci -q delete "$key"; }
+        done
         uci set luci.main.mediaurlbase='/luci-static/shadcn'
         uci commit luci
         exit 0
@@ -875,21 +887,22 @@ jobs:
       id: package
       run: |
         cd openwrt
-        # ===== 编译前最后一道防线：全树清除 ttyd（含硬依赖）=====
-        # 09/02 设备端实锤真根因：luci-app-turboacc-mtk（MTK 厂商加速 app，config 选中）
-        # 的 DEPENDS 带 +luci-app-ttyd 硬依赖，“+”前缀在 make defconfig 时强制选中，
-        # config “is not set” 直接被推翻，连带拉进 ttyd 守护进程与中文包。
-        # （DEFAULT_PACKAGES 的 sed 与 98-disable-ttyd 兜底都对，但都拦不住“+”依赖。）
-        # 修法：make defconfig 前扫掉 package/、feeds/ 全部 Makefile 里的 +luci-app-ttyd、
-        # +ttyd 依赖记号，再对 target/linux 做 DEFAULT_PACKAGES/DEVICE_PACKAGES 清扫。
-        grep -rl --include='Makefile' -e '+luci-app-ttyd' -e '+ttyd\b' package/ feeds/ 2>/dev/null | xargs -r sed -i -e 's/+luci-app-ttyd//g' -e 's/+ttyd\b//g'
-        grep -rlE --include='Makefile' --include='*.mk' '\bttyd\b' target/linux/ 2>/dev/null | xargs -r sed -i -e 's/luci-i18n-ttyd-zh-cn //g' -e 's/luci-app-ttyd //g' -e 's/\bttyd\b//g'
-        echo "########## 验证：ttyd 硬依赖与默认包残留（均应为空）##########"
-        grep -rn --include='Makefile' -e '+luci-app-ttyd' -e '+ttyd\b' package/ feeds/ 2>/dev/null && echo "!!! 警告：仍有包硬依赖 ttyd，固件将带网页终端 !!!" || echo "确认：package/feeds 已无 +ttyd 系硬依赖"
-        if grep -rnE --include='Makefile' --include='*.mk' '\bttyd\b' target/linux/ 2>/dev/null; then
-          echo "!!! 警告：target/linux 下仍残留 ttyd 条目 !!!"
+        # ===== 编译前最后一道防线：全树清除黑名单包（ttyd 全家 + 已弃用主题，含硬依赖）=====
+        # 实锤根因一（09/02）：luci-app-turboacc-mtk 的 DEPENDS 带 +luci-app-ttyd，“+”前缀在
+        # make defconfig 时强制选中，config “is not set” 直接被推翻，连带拉进 ttyd 全家。
+        # 实锤根因二（09/06）：luci 集合包 → luci-light → +luci-theme-bootstrap 硬依赖链，
+        # bootstrap 主题（含 dark/light 变体）因此始终随固件；argon 已由 config not set
+        # 拦住，但 +依赖记号一并清扫，防任何包引用。
+        # 修法：make defconfig 前扫掉 package/、feeds/ 全部 Makefile 里黑名单包的
+        # “+包名”硬依赖记号，再对 target/linux 做 DEFAULT_PACKAGES/DEVICE_PACKAGES 清扫。
+        grep -rl --include='Makefile' -e '+luci-app-ttyd' -e '+ttyd\b' -e '+luci-theme-bootstrap\b' -e '+luci-theme-argon\b' package/ feeds/ 2>/dev/null | xargs -r sed -i -e 's/+luci-app-ttyd//g' -e 's/+ttyd\b//g' -e 's/+luci-theme-bootstrap-mod//g' -e 's/+luci-theme-bootstrap\b//g' -e 's/+luci-theme-argon\b//g'
+        grep -rlE --include='Makefile' --include='*.mk' '\b(ttyd|luci-theme-argon|luci-theme-bootstrap)\b' target/linux/ 2>/dev/null | xargs -r sed -i -e 's/luci-i18n-ttyd-zh-cn //g' -e 's/luci-app-ttyd //g' -e 's/\bttyd\b//g' -e 's/luci-theme-bootstrap-mod //g' -e 's/luci-theme-bootstrap //g' -e 's/luci-theme-argon //g'
+        echo "########## 验证：黑名单包硬依赖与默认包残留（均应为空）##########"
+        grep -rn --include='Makefile' -e '+luci-app-ttyd' -e '+ttyd\b' -e '+luci-theme-bootstrap\b' -e '+luci-theme-argon\b' package/ feeds/ 2>/dev/null && echo "!!! 警告：仍有黑名单包硬依赖残留 !!!" || echo "确认：package/feeds 已无黑名单硬依赖"
+        if grep -rnE --include='Makefile' --include='*.mk' '\b(ttyd|luci-theme-argon|luci-theme-bootstrap)\b' target/linux/ 2>/dev/null; then
+          echo "!!! 警告：target/linux 下仍残留黑名单条目 !!!"
         else
-          echo "确认：target/linux 全树已无 ttyd 条目"
+          echo "确认：target/linux 全树已无 ttyd/弃用主题条目"
         fi
         # ===== 克隆两个定制主题进 package/（必须在 make defconfig 之前，CONFIG 符号才会生成）=====
         # shadcn：仓库根目录即包（Makefile+htdocs+ucode，PKG_VERSION 已硬编码）。
